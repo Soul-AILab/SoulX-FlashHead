@@ -82,7 +82,7 @@ pip install flash_attn==2.8.0.post2 --no-build-isolation
 pip install sageattention==2.2.0 --no-build-isolation
 ```
 
-#### 5. FFmpeg installation
+#### 6. FFmpeg installation
 ```bash
 # Ubuntu / Debian
 apt-get install ffmpeg
