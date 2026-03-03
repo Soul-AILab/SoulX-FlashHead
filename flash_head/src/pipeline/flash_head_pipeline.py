@@ -204,8 +204,7 @@ class FlashHeadPipeline:
 
     @torch.no_grad()
     def preprocess_audio(self, speech_array, sr=16000, fps=25):
-        audio_duration = len(speech_array) / sr
-        video_length = audio_duration * fps
+        video_length = len(speech_array) * fps / sr
 
         # wav2vec_feature_extractor
         audio_feature = np.squeeze(
@@ -312,6 +311,6 @@ class FlashHeadPipeline:
         if self.rank == 0:
             print(f'[generate] encode motion frames: {end_encode_time - start_encode_time}s')
 
-        gen_video_samples = videos[:, :, self.motion_frames_num:]
+        gen_video_samples = videos #[:, :, self.motion_frames_num:]
 
         return gen_video_samples[0].to(torch.float32)
