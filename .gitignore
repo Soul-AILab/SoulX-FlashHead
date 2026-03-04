@@ -5,5 +5,7 @@ logs/
 assets/
 examples/
 sample_results/
+gradio_results/
+gradio_results_multigpu/
 models/
 tools/
