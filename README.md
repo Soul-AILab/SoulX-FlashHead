@@ -33,6 +33,7 @@
 - [x] Technical report 
 - [x] Project Page
 - [x] Inference code
+- [x] Streaming online demo on HuggingFace
 - [x] Distilled Checkpoint of Pro-Model & Lite-Model release
 - [ ] Pretrained Checkpoint release
 
@@ -133,6 +134,10 @@ python gradio_app.py
 # streaming gradio demo (Only support single GPU)
 python gradio_app_streaming.py
 ```
+
+### 🤗 Streaming online demo
+Click [here](https://huggingface.co/spaces/Soul-AILab/SoulX-FlashHead) to experience the real-time streaming demo on HuggingFace Spaces.
+
 
 ### 👋 Online Experience 
 For a real-time interactive experience, scan the QR code to enter the event link. [2026.2.12~2026.3.11]
