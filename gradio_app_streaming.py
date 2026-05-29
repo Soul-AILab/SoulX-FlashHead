@@ -99,13 +99,18 @@ def run_inference_streaming(
     """
     global pipeline, loaded_ckpt_dir, loaded_wav2vec_dir, loaded_model_type
 
+    is_cold_start = pipeline is None
     if (
         pipeline is None
         or loaded_ckpt_dir != ckpt_dir
         or loaded_wav2vec_dir != wav2vec_dir
         or loaded_model_type != model_type
     ):
-        progress(0.2, desc="Loading Model...")
+        is_cold_start = True
+        if is_cold_start:
+            progress(0.1, desc="Loading model weights (first run takes ~1-2 min for compilation)...")
+        else:
+            progress(0.1, desc="Loading Model...")
         logger.info(f"Loading pipeline with ckpt_dir={ckpt_dir}, wav2vec_dir={wav2vec_dir}")
         try:
             pipeline = get_pipeline(
@@ -121,7 +126,10 @@ def run_inference_streaming(
             logger.error(f"Failed to load model: {e}")
             raise gr.Error(f"Failed to load model: {e}")
 
-    progress(0.5, desc="Preparing Data...")
+    if is_cold_start:
+        progress(0.4, desc="Encoding condition image (compiling VAE, may take ~20s)...")
+    else:
+        progress(0.4, desc="Preparing Data...")
     base_seed = int(seed) if seed >= 0 else 9999
     try:
         get_base_data(
@@ -205,18 +213,29 @@ def run_inference_streaming(
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:]
             torch.cuda.synchronize()
-            logger.info(f"Infer chunk-{chunk_idx} done, cost time: {time.time() - start_time:.2f}s")
+            elapsed = time.time() - start_time
+            logger.info(f"Infer chunk-{chunk_idx} done, cost time: {elapsed:.2f}s")
             chunk_frames_np = video.cpu().numpy()
             res_queue.put((chunk_idx, chunk_frames_np))
-        res_queue.put(None)  # 结束哨兵
+        res_queue.put(None)
+
+    if is_cold_start:
+        progress(0.6, desc="Warming up model (compiling kernels, first chunk takes ~60s)...")
+    else:
+        progress(0.7, desc="Starting generation...")
 
     worker_thread = threading.Thread(target=inference_worker)
     worker_thread.start()
     logger.info("Inference worker thread started. Main will consume res_queue and yield video paths.")
 
-    # 主程序：监控 res_queue，每凑满 k 个 chunk 合并为一段 mp4（含对应段音频）并 yield
     frame_buffer = []
+    warmup_notified = False
     while True:
+        while res_queue.empty():
+            if not warmup_notified and is_cold_start:
+                progress(0.7, desc="Compiling CUDA kernels (one-time, ~60s)... Subsequent runs will be fast.")
+                warmup_notified = True
+            time.sleep(0.5)
         item = res_queue.get()
         if item is None:
             break
