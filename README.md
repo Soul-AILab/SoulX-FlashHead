@@ -204,7 +204,7 @@ If you find our work useful in your research, please consider citing:
 
 ## 💡 Star History
 <p align="center">
-  <a href="https://star-history.com/#Soul-AILab/SoulX-FlashHead&Date">
-    <img src="https://api.star-history.com/svg?repos=Soul-AILab/SoulX-FlashHead&type=Date" alt="Star History Chart" width="100%">
+  <a href="https://star-history.dera.page/#Soul-AILab/SoulX-FlashHead&Date">
+    <img src="https://star-history.dera.page/svg?repos=Soul-AILab/SoulX-FlashHead&type=Date" alt="Star History Chart" width="100%">
   </a>
 </p>
