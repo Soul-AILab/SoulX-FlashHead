@@ -127,14 +127,14 @@ class FlashHeadPipeline:
         self.use_timestep_transform = use_timestep_transform
 
         if COMPILE_MODEL:
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
         if COMPILE_VAE:
             if self.use_ltx:
                 self.vae.model.encode = torch.compile(self.vae.model.encode)
                 self.vae.model.decode = torch.compile(self.vae.model.decode)
             else:
                 self.vae.encode = torch.compile(self.vae.encode)
-                self.vae.decode = torch.compile(self.vae.decode)
+                self.vae.decode = torch.compile(self.vae.decode, mode="max-autotune")
 
         self.audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec_dir, local_files_only=True).to(self.device)
         self.audio_encoder.feature_extractor._freeze_parameters()

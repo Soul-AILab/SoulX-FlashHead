@@ -210,6 +210,11 @@ def generate(args):
         logger.info("Finished.")
 
     if world_size > 1:
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+        # Release captured NCCL operations before destroying process groups.
+        torch.cuda.synchronize()
+        reset_cudagraph_trees()
         dist.barrier()
         dist.destroy_process_group()
 
