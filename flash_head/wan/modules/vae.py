@@ -951,6 +951,49 @@ def _video_vae(
 
     return model
 
+
+_NCDHW_CONV3D_PROBE = {}
+
+
+def _ncdhw_conv3d_needs_channels_last(dtype, device):
+    """Whether Conv3d weights should be held in channels_last_3d.
+
+    Some torch builds (>=2.8 with cu130 on sm_120) stop routing half/bf16 NCDHW
+    Conv3d to cuDNN and fall back to ``slow_conv_dilated3d``, roughly halving VAE
+    decode throughput. Converting the weights to NDHWC restores the cuDNN
+    backend there, but on builds where NCDHW already reaches cuDNN the same
+    conversion pins a layout torch.compile would rather pick itself and costs
+    ~15%. Ask the dispatcher which backend it would select instead of guessing
+    from version numbers.
+    """
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device(device if device is not None else "cuda")
+    if device.type != "cuda":
+        return False
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+
+    key = (dtype, torch.cuda.get_device_capability(device))
+    if key in _NCDHW_CONV3D_PROBE:
+        return _NCDHW_CONV3D_PROBE[key]
+
+    needs = False
+    try:
+        x = torch.empty(1, 8, 3, 8, 8, device=device, dtype=dtype)
+        w = torch.empty(8, 8, 3, 3, 3, device=device, dtype=dtype)
+        b = torch.empty(8, device=device, dtype=dtype)
+        backend = torch._C._select_conv_backend(
+            x, w, b, [1, 1, 1], [1, 1, 1], [1, 1, 1], False, [0, 0, 0], 1
+        )
+        needs = backend != torch._C._ConvBackend.Cudnn
+    except Exception as e:  # probe is best-effort; keep the stock layout
+        logger.warning(f"Vae: Conv3d backend probe failed ({e}), keeping NCDHW")
+
+    _NCDHW_CONV3D_PROBE[key] = needs
+    return needs
+
+
 class WanVAE:
     def __init__(
         self,
@@ -1057,6 +1100,20 @@ class WanVAE:
             .to(device)
             .to(dtype)
         )
+
+        # torch>=2.8 (cu130) stopped dispatching half/bf16 NCDHW Conv3d to cuDNN
+        # on sm_120 and falls back to slow_conv_dilated3d, which makes decode
+        # ~1.8x slower. Holding the weights in NDHWC forces the cuDNN backend
+        # back. Where NCDHW already reaches cuDNN (e.g. torch 2.7/cu128) the
+        # conversion instead fights torch.compile's own layout choice and costs
+        # ~15%, so probe the dispatcher and only convert when it is needed.
+        if _ncdhw_conv3d_needs_channels_last(dtype, device):
+            logger.info("Vae: NCDHW Conv3d misses cuDNN on this torch build, "
+                        "converting Conv3d weights to channels_last_3d")
+            for m in self.model.modules():
+                if isinstance(m, nn.Conv3d):
+                    m.weight.data = m.weight.data.contiguous(
+                        memory_format=torch.channels_last_3d)
 
     def _calculate_2d_grid(self, latent_height, latent_width, world_size):
         if (latent_height, latent_width, world_size) in self.grid_table:
