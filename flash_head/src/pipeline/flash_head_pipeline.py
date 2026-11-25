@@ -15,6 +15,8 @@ from flash_head.audio_analysis.wav2vec2 import Wav2Vec2Model
 from flash_head.utils.utils import match_and_blend_colors_torch, resize_and_centercrop
 from flash_head.utils.facecrop import process_image
 
+# use FP8 GEMM to speedup inference
+USE_FP8_GEMM = True
 # compile models to speedup inference
 COMPILE_MODEL = True
 COMPILE_VAE = True
@@ -111,6 +113,10 @@ class FlashHeadPipeline:
         self.model = WanModelAudioProject.from_pretrained(model_dir)
         self.model.eval().requires_grad_(False)
         self.model.to(device=self.device, dtype=self.param_dtype)
+
+        if USE_FP8_GEMM:
+            from flash_head.fp8_gemm import enable_fp8_gemm
+            enable_fp8_gemm(self.model)
 
         self.config = self.model.config
 
