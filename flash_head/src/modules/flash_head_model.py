@@ -33,6 +33,14 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     
     
+# fuse q/k RMSNorm + RoPE into one Triton kernel (single-GPU path, bf16)
+USE_FUSED_RMSNORM_ROPE = True
+try:
+    from flash_head.src.modules.fused_rmsnorm_rope import rmsnorm_rope
+    FUSED_RMSNORM_ROPE_AVAILABLE = True
+except ImportError:
+    FUSED_RMSNORM_ROPE_AVAILABLE = False
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -148,7 +156,7 @@ def rope_apply(x, freqs, grid_sizes, use_usp=False, sp_size=1, sp_rank=0, rope=N
     else:
         # Same rotation as the complex multiply, written as real arithmetic so torch.compile can fuse it
         # (Inductor cannot generate code for complex ops). Still float64, so the result is bit-identical.
-        cos, sin = rope if rope is not None else rope_cos_sin(freqs, grid_sizes)
+        cos, sin = rope[:2] if rope is not None else rope_cos_sin(freqs, grid_sizes)
         a, b = x_i.unbind(-1)
         x_i = torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).flatten(2)
     return x_i.unsqueeze(0).to(x.dtype)
@@ -187,6 +195,12 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, freqs, grid_sizes, rope=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        if rope is not None and len(rope) == 4:
+            # fused path: RMSNorm + RoPE in one Triton kernel, rope[2:] = fp32 cos/sin [L, head_dim // 2]
+            q = rmsnorm_rope(self.q(x)[0], self.norm_q.weight, rope[2], rope[3], self.norm_q.eps)[None]
+            k = rmsnorm_rope(self.k(x)[0], self.norm_k.weight, rope[2], rope[3], self.norm_k.eps)[None]
+            x = flash_attention(q=q, k=k, v=self.v(x), num_heads=self.num_heads)
+            return self.o(x)
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x)
@@ -489,6 +503,9 @@ class WanModelAudioProject(ModelMixin, ConfigMixin):
 
         # RoPE cos/sin table: built once per forward and shared by all blocks (the multi-GPU path builds its own)
         rope = None if self.use_usp else rope_cos_sin(self.freqs, grid_sizes)
+        if (rope is not None and USE_FUSED_RMSNORM_ROPE and FUSED_RMSNORM_ROPE_AVAILABLE and x.is_cuda
+                and x.shape[0] == 1 and x.dtype == torch.bfloat16):
+            rope = rope + tuple(t.view(t.shape[0], -1).float() for t in rope)   # + fp32 cos/sin for the fused kernel
         for block in self.blocks:
             x = block(x, context, t_mod, self.freqs, grid_sizes, rope)
         x = self.head(x, t)   # (bsz, 9*32*32, 64)
