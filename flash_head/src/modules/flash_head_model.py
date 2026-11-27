@@ -33,6 +33,14 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     
     
+# fuse q/k RMSNorm + RoPE into one Triton kernel (single-GPU path, bf16)
+USE_FUSED_RMSNORM_ROPE = True
+try:
+    from flash_head.src.modules.fused_rmsnorm_rope import rmsnorm_rope
+    FUSED_RMSNORM_ROPE_AVAILABLE = True
+except ImportError:
+    FUSED_RMSNORM_ROPE_AVAILABLE = False
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -101,42 +109,56 @@ def pad_freqs(original_tensor, target_len):
     padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
     return padded_tensor
 
-def rope_apply(x, freqs, grid_sizes, use_usp=False, sp_size=1, sp_rank=0):
+def rope_cos_sin(freqs, grid_sizes):
     """
-    x:          [B, L, N, C].
-    grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
+    Real cos/sin RoPE table for an (f, h, w) grid: two float64 tensors of shape [f*h*w, 1, C // 2].
+    Same numbers as the complex freqs_i in rope_apply; build it once per forward and share it across blocks.
     """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1) # [[N, head_dim/2], [N, head_dim/2], [N, head_dim/2]] # T H W 极坐标
-
-    # loop over samples
-
+    c = freqs.size(1)
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     (f, h, w) = grid_sizes
-    seq_len = f * h * w
-
-    # precompute multipliers
-    x_i = torch.view_as_complex(x[0, :s].to(torch.float64).reshape(
-        s, n, -1, 2)) # [L, N, C/2] # 极坐标
     freqs_i = torch.cat([
         freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ],
-                        dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
+                        dim=-1).reshape(f * h * w, 1, -1)
+    return freqs_i.real.contiguous(), freqs_i.imag.contiguous()
+
+def rope_apply(x, freqs, grid_sizes, use_usp=False, sp_size=1, sp_rank=0, rope=None):
+    """
+    x:          [B, L, N, C].
+    grid_sizes: [B, 3].
+    freqs:      [M, C // 2].
+    rope:       optional (cos, sin) from rope_cos_sin, used by the single-GPU path.
+    """
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    x_i = x[0, :s].to(torch.float64).reshape(s, n, -1, 2) # [L, N, C/2, 2]: (a, b) pairs
 
     if use_usp:
+        # split freqs
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1) # [[N, head_dim/2], [N, head_dim/2], [N, head_dim/2]] # T H W 极坐标
+        (f, h, w) = grid_sizes
+        seq_len = f * h * w
+        freqs_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+                            dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
         # apply rotary embedding
         freqs_i = pad_freqs(freqs_i, s * sp_size)
         s_per_rank = s
         freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
                                                         s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = torch.view_as_real(torch.view_as_complex(x_i) * freqs_i_rank).flatten(2)
         x_i = torch.cat([x_i, x[0, s:]])
     else:
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[0, seq_len:]])
+        # Same rotation as the complex multiply, written as real arithmetic so torch.compile can fuse it
+        # (Inductor cannot generate code for complex ops). Still float64, so the result is bit-identical.
+        cos, sin = rope[:2] if rope is not None else rope_cos_sin(freqs, grid_sizes)
+        a, b = x_i.unbind(-1)
+        x_i = torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).flatten(2)
     return x_i.unsqueeze(0).to(x.dtype)
 
 
@@ -171,8 +193,14 @@ class SelfAttention(nn.Module):
         self.sp_size = get_sequence_parallel_world_size() if self.use_usp else 1
         self.sp_rank = get_sequence_parallel_rank() if self.use_usp else 0
 
-    def forward(self, x, freqs, grid_sizes):
+    def forward(self, x, freqs, grid_sizes, rope=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        if rope is not None and len(rope) == 4:
+            # fused path: RMSNorm + RoPE in one Triton kernel, rope[2:] = fp32 cos/sin [L, head_dim // 2]
+            q = rmsnorm_rope(self.q(x)[0], self.norm_q.weight, rope[2], rope[3], self.norm_q.eps)[None]
+            k = rmsnorm_rope(self.k(x)[0], self.norm_k.weight, rope[2], rope[3], self.norm_k.eps)[None]
+            x = flash_attention(q=q, k=k, v=self.v(x), num_heads=self.num_heads)
+            return self.o(x)
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x)
@@ -192,8 +220,8 @@ class SelfAttention(nn.Module):
             ).flatten(2)
         else:
             x = flash_attention(
-                q=rope_apply(q, freqs, grid_sizes).flatten(2),
-                k=rope_apply(k, freqs, grid_sizes).flatten(2),
+                q=rope_apply(q, freqs, grid_sizes, rope=rope).flatten(2),
+                k=rope_apply(k, freqs, grid_sizes, rope=rope).flatten(2),
                 v=v,
                 num_heads=self.num_heads
             )
@@ -259,11 +287,11 @@ class DiTAudioBlock(nn.Module):
         self.sp_size = get_sequence_parallel_world_size() if self.use_usp else 1
         self.sp_rank = get_sequence_parallel_rank() if self.use_usp else 0
 
-    def forward(self, x, context, t_mod, freqs, grid_sizes):
+    def forward(self, x, context, t_mod, freqs, grid_sizes, rope=None):
         e = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
 
         y = self.self_attn(
-            self.norm1(x) * (1 + e[1]) + e[0], freqs, grid_sizes)
+            self.norm1(x) * (1 + e[1]) + e[0], freqs, grid_sizes, rope)
 
         x = x + y * e[2]
 
@@ -473,8 +501,13 @@ class WanModelAudioProject(ModelMixin, ConfigMixin):
         if self.use_usp:
             x = torch.chunk(x, self.sp_size, dim=1)[self.sp_rank]
 
+        # RoPE cos/sin table: built once per forward and shared by all blocks (the multi-GPU path builds its own)
+        rope = None if self.use_usp else rope_cos_sin(self.freqs, grid_sizes)
+        if (rope is not None and USE_FUSED_RMSNORM_ROPE and FUSED_RMSNORM_ROPE_AVAILABLE and x.is_cuda
+                and x.shape[0] == 1 and x.dtype == torch.bfloat16):
+            rope = rope + tuple(t.view(t.shape[0], -1).float() for t in rope)   # + fp32 cos/sin for the fused kernel
         for block in self.blocks:
-            x = block(x, context, t_mod, self.freqs, grid_sizes)
+            x = block(x, context, t_mod, self.freqs, grid_sizes, rope)
         x = self.head(x, t)   # (bsz, 9*32*32, 64)
         if self.use_usp:
             x = get_sp_group().all_gather(x, dim=1)
