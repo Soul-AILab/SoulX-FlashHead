@@ -117,8 +117,7 @@ def rope_apply(x, freqs, grid_sizes, use_usp=False, sp_size=1, sp_rank=0):
     seq_len = f * h * w
 
     # precompute multipliers
-    x_i = torch.view_as_complex(x[0, :s].to(torch.float64).reshape(
-        s, n, -1, 2)) # [L, N, C/2] # 极坐标
+    x_i = x[0, :s].to(torch.float64).reshape(s, n, -1, 2) # [L, N, C/2, 2]: (a, b) pairs
     freqs_i = torch.cat([
         freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -132,11 +131,14 @@ def rope_apply(x, freqs, grid_sizes, use_usp=False, sp_size=1, sp_rank=0):
         s_per_rank = s
         freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
                                                         s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = torch.view_as_real(torch.view_as_complex(x_i) * freqs_i_rank).flatten(2)
         x_i = torch.cat([x_i, x[0, s:]])
     else:
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[0, seq_len:]])
+        # Same rotation as the complex multiply, written as real arithmetic so torch.compile can fuse it
+        # (Inductor cannot generate code for complex ops). Still float64, so the result is bit-identical.
+        a, b = x_i.unbind(-1)
+        cos, sin = freqs_i.real, freqs_i.imag
+        x_i = torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).flatten(2)
     return x_i.unsqueeze(0).to(x.dtype)
 
 
